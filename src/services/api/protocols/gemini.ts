@@ -11,6 +11,16 @@ import type {
 import { BlockStream, mapFinishReason, usageOf } from './blocks.js'
 import { localRef } from './inline.js'
 import { asString, isRecord } from './json.js'
+import type { SkillSource } from './skills.js'
+import {
+  mergeSkillSources,
+  readSearchQueries,
+  readSkillSources,
+  searchToolResult,
+  searchToolUse,
+  sourceCitation,
+  uniqueSkillSources,
+} from './skills.js'
 import type { AttachmentLoader, ProtocolAdapter, StreamOptions } from './types.js'
 import { UNAVAILABLE_ATTACHMENT_TEXT } from './types.js'
 
@@ -118,7 +128,7 @@ const readUsage = (value: unknown): MessageUsage | undefined => {
 }
 
 async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEvent> {
-  const { provider, request: chat, loadAttachment, signal } = options
+  const { provider, deepseek, request: chat, loadAttachment, signal } = options
   const contents = await toContents(chat.messages, loadAttachment)
   const body: Record<string, unknown> = {
     systemInstruction: { parts: [{ text: chat.system }] },
@@ -131,6 +141,10 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
         thinkingBudget: THINKING_BUDGET[chat.thinkingLevel],
       },
     }
+  }
+  if (!deepseek && chat.search) {
+    // Gemini 的标准内置搜索；结果通过候选上的 groundingMetadata 返回。
+    body.tools = [{ googleSearch: {} }]
   }
   const url = `${baseUrl(provider.baseUrl)}/models/${encodeURIComponent(modelPath(chat.model))}:streamGenerateContent?alt=sse`
   const response = await request(url, {
@@ -146,6 +160,12 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
 
   const blocks = new BlockStream()
   let usage: MessageUsage | undefined
+  // groundingMetadata 可能只在最后一个分片给出；先累计，收尾时再决定展示方式。
+  const groundingSources: SkillSource[] = []
+  const groundingQueries: string[] = []
+  let searchId = ''
+  let searchEmitted = false
+  let textStarted = false
   for await (const { data } of readServerSentEvents(response.body, signal)) {
     let payload: unknown
     try {
@@ -172,6 +192,22 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
     if (!isRecord(candidate)) {
       continue
     }
+    // 少数代理会在首个分片就带 grounding；能确定来源时先声明搜索步骤，结果在收尾补齐。
+    const grounding =
+      !deepseek && isRecord(candidate.groundingMetadata) ? candidate.groundingMetadata : undefined
+    if (grounding) {
+      mergeSkillSources(groundingSources, readSkillSources(grounding.groundingChunks))
+      for (const query of readSearchQueries(grounding.webSearchQueries)) {
+        if (!groundingQueries.includes(query)) {
+          groundingQueries.push(query)
+        }
+      }
+      if (!searchEmitted && !textStarted && groundingSources.length > 0) {
+        searchId = `gemini_web_${Date.now()}`
+        searchEmitted = true
+        yield* blocks.tool(searchToolUse(searchId, groundingQueries))
+      }
+    }
     const content = isRecord(candidate.content) ? candidate.content : undefined
     const parts = content && Array.isArray(content.parts) ? content.parts : []
     for (const part of parts) {
@@ -182,11 +218,24 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
       if (part.thought === true) {
         yield* blocks.thinking(value)
       } else {
+        if (value) {
+          textStarted = true
+        }
         yield* blocks.text(value)
       }
     }
     const stopReason: StopReason | null = mapFinishReason(asString(candidate.finishReason))
     if (stopReason) {
+      if (searchEmitted) {
+        yield* blocks.tool(searchToolResult(searchId, groundingSources))
+      } else if (groundingSources.length > 0) {
+        // Gemini 通常在正文之后才给 grounding，无法回头插入调用块；
+        // 先补文本引用，再补一个没有调用块的来源结果，底部来源卡片仍能展示。
+        for (const source of uniqueSkillSources(groundingSources)) {
+          yield* blocks.citation(sourceCitation(source))
+        }
+        yield* blocks.tool(searchToolResult(`gemini_grounding_${Date.now()}`, groundingSources))
+      }
       yield* blocks.finish(stopReason, usage)
       return
     }

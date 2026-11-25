@@ -219,6 +219,7 @@ const toUserParam = ({ content, files }: UserMessage, extra?: string): MessagePa
  * - 文本块去掉 citations（服务端忽略）。相邻文本直接拼接，被思考或工具隔开的文本用空行连接；
  *   省略历史思考后仍保留其前后正文的空行；
  * - 工具调用和结果只保留 kind 为 read_link 的块，其他历史工具块不回传；
+ *   标准协议的搜索块（kind 为 search）同样不回传，但其正文已按文本块保留；
  * - 阅读链接结果原样回传，保留 signature：服务端解密后将页面拼回该轮提问末尾；
  */
 const toAssistantParam = (

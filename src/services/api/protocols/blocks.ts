@@ -1,4 +1,10 @@
-import type { MessageStreamEvent, MessageUsage, StopReason } from '../types.js'
+import type {
+  MessageStreamEvent,
+  MessageUsage,
+  ServerToolBlock,
+  StopReason,
+  TextCitation,
+} from '../types.js'
 
 /** 统一构造用量；没有缓存信息时补 0，界面按字段存在与否展示 */
 export const usageOf = (input: number, output: number, cached = 0): MessageUsage => ({
@@ -58,6 +64,28 @@ export class BlockStream {
   *thinking(value: string | null | undefined): Generator<MessageStreamEvent> {
     if (value) {
       yield* this.delta('thinking', value)
+    }
+  }
+
+  /** 追加一个完整的服务端工具块：先结束当前文本 / 思考块，再按顺序分配新索引 */
+  *tool(block: ServerToolBlock): Generator<MessageStreamEvent> {
+    yield* this.close()
+    this.index += 1
+    const index = this.index
+    yield { type: 'content_block_start', index, content_block: block }
+    yield { type: 'content_block_stop', index }
+  }
+
+  /** 给当前打开的文本块补一条引用；没有打开的文本块时忽略，避免产生悬空引用 */
+  *citation(citation: TextCitation): Generator<MessageStreamEvent> {
+    if (this.open?.kind !== 'text') {
+      return
+    }
+    const { index } = this.open
+    yield {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'citations_delta', citation },
     }
   }
 

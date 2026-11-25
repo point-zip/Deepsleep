@@ -1094,19 +1094,21 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         // 供应商没有服务端工具时，由「工具服务」在客户端完成搜索、抓取与 OCR
         const serverTools = getProviderExtensions(provider).deepseek
         const toolsEndpoint = serverTools ? null : getToolsEndpoint()
+        // 标准协议已声明服务端搜索时不再做客户端预搜索，避免同一轮重复搜索
+        const clientSearch = (initial.search ?? false) && !features.search
         const documents =
           features.files === 'api' || !toolsEndpoint
             ? []
             : prepared.question.files.filter((file) => !file.isImage)
         const clientRun =
           toolsEndpoint &&
-          (initial.search ||
+          (clientSearch ||
             documents.length > 0 ||
             extractUrls(prepared.question.content).length > 0)
             ? await runClientTools({
                 endpoint: toolsEndpoint,
                 question: prepared.question,
-                search: initial.search ?? false,
+                search: clientSearch,
                 documents,
                 signal: controller.signal,
               })

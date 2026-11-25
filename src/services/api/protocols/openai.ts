@@ -131,6 +131,7 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
     // 思考等级直接映射到 OpenAI 的 reasoning_effort；关闭时给最低档，避免模型长时间思考。
     body.reasoning_effort = chat.thinking ? chat.thinkingLevel : 'minimal'
   }
+  // Chat Completions 没有标准的服务端搜索工具，非 DeepSeek 保持不声明 tools，搜索由客户端工具服务补齐。
   const response = await request(`${baseUrl(provider.baseUrl)}/chat/completions`, {
     method: 'POST',
     headers: { ...authorization(provider.apiKey), Accept: 'text/event-stream' },

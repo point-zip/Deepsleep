@@ -4,7 +4,8 @@
  *
  * 请求侧同样是规范格式：ChatRequest 交给适配器后由它翻译成 Anthropic Messages、
  * OpenAI Chat Completions / Responses 或 Gemini generateContent 的请求体。
- * 服务端工具块（deepseek_web_search / deepseek_read_url）只在 DeepSeek 扩展下产生。
+ * 服务端工具块由 DeepSeek 扩展（deepseek_web_search / deepseek_read_url）
+ * 或标准协议的内置联网搜索工具（web_search）产生。
  */
 
 // ---------- 响应：内容块 ----------
@@ -43,13 +44,16 @@ export type ServerToolInput =
   | { action: 'find_in_page'; url: string; pattern: string }
   | { action: 'read_link'; url: string }
 
+/** 服务端工具名：DeepSeek 扩展两个，标准协议的内置搜索为 web_search */
+export type ServerToolName = 'deepseek_web_search' | 'deepseek_read_url' | 'web_search'
+
 /** 服务端工具调用块：原子下发，content_block_start 即携带完整 input */
 export type ServerToolUseBlock = {
   type: 'server_tool_use'
-  /** srvtoolu_{s|ds|rl|is|dis}_{序号}_{32 位 hex} */
+  /** DeepSeek 为 srvtoolu_{s|ds|rl|is|dis}_{序号}_{32 位 hex}；标准协议沿用服务端 id */
   id: string
-  /** 文字搜索与图搜均为 deepseek_web_search；read_link 为 deepseek_read_url */
-  name: 'deepseek_web_search' | 'deepseek_read_url'
+  /** 文字搜索与图搜均为 deepseek_web_search；read_link 为 deepseek_read_url；标准搜索为 web_search */
+  name: ServerToolName
   input: ServerToolInput
   caller: { type: 'direct' }
   kind: ServerToolKind
@@ -202,7 +206,7 @@ export type ChatRequest = {
   thinking: boolean
   /** 深度思考的强度；不支持分级的供应商只使用 thinking 开关 */
   thinkingLevel: ThinkingLevel
-  /** 联网搜索：DeepSeek 用 deepseek_web_search，客户端工具用 Search 接口补齐 */
+  /** 联网搜索：DeepSeek 用 deepseek_web_search，标准协议用内置搜索工具，客户端工具用 Search 接口补齐 */
   search: boolean
   /** 请求服务端生成会话标题（仅 DeepSeek 扩展支持） */
   title: boolean

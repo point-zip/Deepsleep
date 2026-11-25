@@ -187,6 +187,9 @@ export const buildReplyView = (reply: AssistantMessage, streaming: boolean): Rep
       results.set(block.tool_use_id, block)
     }
   }
+  const calledToolIds = new Set(
+    reply.blocks.flatMap((block) => (block.type === 'server_tool_use' ? [block.id] : []))
+  )
 
   const registry = new SourceRegistry()
   const searchResults: Source[] = []
@@ -216,6 +219,21 @@ export const buildReplyView = (reply: AssistantMessage, streaming: boolean): Rep
       block.kind === 'deep_search'
     ) {
       registry.add(result.content.url, result.content.content.title, result.content.published_at)
+    }
+  }
+
+  // 没有配对调用块的孤立结果（如 Gemini 在正文结束后才下发的 grounding）也要展示来源
+  for (const block of reply.blocks) {
+    if (block.type !== 'web_search_tool_result' || calledToolIds.has(block.tool_use_id)) {
+      continue
+    }
+    for (const item of block.content) {
+      if (item.type === 'web_search_result') {
+        const source = registry.add(item.url, item.title, item.page_age, item)
+        if (source && !searchResults.includes(source)) {
+          searchResults.push(source)
+        }
+      }
     }
   }
 

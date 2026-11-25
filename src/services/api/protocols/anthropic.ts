@@ -16,7 +16,11 @@ import type {
   MessageParam,
   MessageStreamEvent,
   ThinkingLevel,
+  WebSearchResult,
+  WebSearchToolResultBlock,
 } from '../types.js'
+import { asString, isRecord } from './json.js'
+import { readSearchQueries, searchToolUse, WEB_SEARCH_NAME } from './skills.js'
 import type { AttachmentLoader, ProtocolAdapter, StreamOptions } from './types.js'
 import { UNAVAILABLE_ATTACHMENT_TEXT } from './types.js'
 
@@ -136,6 +140,148 @@ const tools = (search: boolean) => [
   ...(search ? [{ type: 'deepseek_web_search', name: 'deepseek_web_search' }] : []),
 ]
 
+const indexOf = (value: unknown) =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+
+const parsePartialJson = (value: string): unknown => {
+  if (!value.trim()) {
+    return undefined
+  }
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
+
+/** 官方 web_search_tool_result 的 content 既可能是结果数组，也可能是单个错误对象 */
+const readStandardSearchResult = (value: unknown): WebSearchToolResultBlock | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+  const toolUseId = asString(value.tool_use_id)
+  if (!toolUseId) {
+    return null
+  }
+  const items =
+    value.content === undefined
+      ? []
+      : Array.isArray(value.content)
+        ? value.content
+        : [value.content]
+  const content: WebSearchToolResultBlock['content'] = []
+  for (const item of items) {
+    if (!isRecord(item)) {
+      continue
+    }
+    if (item.type === 'web_search_tool_result_error') {
+      // 官方错误码比本地多（max_uses_exceeded 等），界面只区分成功与失败，统一归一。
+      content.push({ type: 'web_search_tool_result_error', error_code: 'unavailable' })
+      continue
+    }
+    const url = asString(item.url)
+    if (item.type !== 'web_search_result' || !url) {
+      continue
+    }
+    const result: WebSearchResult = {
+      type: 'web_search_result',
+      url,
+      title: asString(item.title) ?? url,
+      snippet: asString(item.snippet) ?? '',
+      page_age: asString(item.page_age) ?? null,
+      encrypted_content: asString(item.encrypted_content) ?? '',
+      site_icon: null,
+      site_name: null,
+    }
+    content.push(result)
+  }
+  return { type: 'web_search_tool_result', tool_use_id: toolUseId, content, kind: 'search' }
+}
+
+type PendingSearchUse = { id: string; inputJson: string }
+
+/**
+ * 官方 Anthropic 的搜索事件与 DeepSeek 扩展不完全一致：
+ * server_tool_use 在 content_block_start 里没有 input，查询参数随后经 input_json_delta 下发；
+ * 这里先缓存，等块结束时再合成一个携带完整 input 的规范块。
+ */
+class StandardAnthropicSkills {
+  private readonly pending = new Map<number, PendingSearchUse>()
+
+  private nextId = 0
+
+  private id() {
+    this.nextId += 1
+    return `srvtoolu_web_${this.nextId}`
+  }
+
+  read(payload: unknown): MessageStreamEvent[] {
+    if (!isRecord(payload)) {
+      return []
+    }
+    const index = indexOf(payload.index)
+    if (payload.type === 'content_block_start' && index !== undefined) {
+      const block = payload.content_block
+      if (isRecord(block) && block.type === 'server_tool_use') {
+        if (asString(block.name) === WEB_SEARCH_NAME) {
+          const id = asString(block.id) ?? this.id()
+          const queries = readSearchQueries(block.input)
+          if (queries.length > 0) {
+            return [
+              { type: 'content_block_start', index, content_block: searchToolUse(id, queries) },
+            ]
+          }
+          this.pending.set(index, { id, inputJson: '' })
+        }
+        // 其他标准服务端工具（如 web_fetch）暂不展示，交给后续事件自然结束。
+        return []
+      }
+      if (isRecord(block) && block.type === 'web_search_tool_result') {
+        const result = readStandardSearchResult(block)
+        return result ? [{ type: 'content_block_start', index, content_block: result }] : []
+      }
+    }
+    if (payload.type === 'content_block_delta' && index !== undefined) {
+      const pending = this.pending.get(index)
+      if (pending && isRecord(payload.delta) && payload.delta.type === 'input_json_delta') {
+        pending.inputJson += asString(payload.delta.partial_json) ?? ''
+        return []
+      }
+    }
+    if (payload.type === 'content_block_stop' && index !== undefined) {
+      const pending = this.pending.get(index)
+      if (pending) {
+        this.pending.delete(index)
+        return [
+          {
+            type: 'content_block_start',
+            index,
+            content_block: searchToolUse(
+              pending.id,
+              readSearchQueries(parsePartialJson(pending.inputJson))
+            ),
+          },
+          { type: 'content_block_stop', index },
+        ]
+      }
+    }
+    if (
+      payload.type === 'message_delta' &&
+      isRecord(payload.delta) &&
+      payload.delta.stop_reason === 'pause_turn'
+    ) {
+      // 官方长搜索会返回 pause_turn；当前界面没有续跑状态，按正常结束收尾，避免丢弃整个 message_delta。
+      const event = readMessageEvent({
+        ...payload,
+        delta: { ...payload.delta, stop_reason: 'end_turn' },
+      })
+      return event ? [event] : []
+    }
+    const event = readMessageEvent(payload)
+    return event ? [event] : []
+  }
+}
+
 const requestBody = (
   { request, deepseek }: Pick<StreamOptions, 'request' | 'deepseek'>,
   messages: Record<string, unknown>[]
@@ -159,6 +305,10 @@ const requestBody = (
   body.max_tokens = Math.max(MAX_TOKENS, budget + 4096)
   if (request.thinking) {
     body.thinking = { type: 'enabled', budget_tokens: budget }
+  }
+  if (request.search) {
+    // 标准 Anthropic 服务端搜索工具；查询、抓取都在服务端完成，客户端只解析结果。
+    body.tools = [{ type: 'web_search_20250305', name: 'web_search' }]
   }
   return body
 }
@@ -188,6 +338,8 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
   if (!response.body || !contentType.includes('text/event-stream')) {
     throw await readErrorResponse(response, 'protocol', '')
   }
+  // DeepSeek 扩展继续走原有解析；标准协议额外归一内置搜索事件。
+  const skills = deepseek ? null : new StandardAnthropicSkills()
   for await (const { event: eventName, data } of readServerSentEvents(response.body, signal)) {
     let payload: unknown
     try {
@@ -203,13 +355,15 @@ async function* stream(options: StreamOptions): AsyncGenerator<MessageStreamEven
     if (eventName === 'error') {
       throw new ApiError('stream', data)
     }
-    const event = readMessageEvent(payload)
-    if (!event) {
-      continue
-    }
-    yield event
-    if (event.type === 'message_stop') {
-      return
+    const events = skills ? skills.read(payload) : [readMessageEvent(payload)]
+    for (const event of events) {
+      if (!event) {
+        continue
+      }
+      yield event
+      if (event.type === 'message_stop') {
+        return
+      }
     }
   }
   // 服务端没有提供错误内容时保持为空，不推测断流原因。

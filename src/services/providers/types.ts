@@ -63,12 +63,17 @@ export type ToolsConfig = {
   apiKey: string
 }
 
-/** 协议默认能力；供应商模板可以覆盖其中几项 */
+/**
+ * 协议默认能力；供应商模板可以覆盖其中几项。
+ * search 表示协议自带服务端联网搜索：Anthropic 声明 web_search，
+ * Responses 声明 web_search 内置工具，Gemini 声明 googleSearch；
+ * OpenAI Chat Completions 没有标准内置搜索，只能靠客户端工具服务补齐。
+ */
 export const PROTOCOL_FEATURES: Record<ProtocolId, ProtocolFeatures> = {
-  anthropic: { thinking: true, search: false, title: false, files: 'api' },
+  anthropic: { thinking: true, search: true, title: false, files: 'api' },
   openai: { thinking: true, search: false, title: false, files: 'inline' },
-  responses: { thinking: true, search: false, title: false, files: 'inline' },
-  gemini: { thinking: true, search: false, title: false, files: 'inline' },
+  responses: { thinking: true, search: true, title: false, files: 'inline' },
+  gemini: { thinking: true, search: true, title: false, files: 'inline' },
 }
 
 /** 协议展示名，设置页的协议下拉框使用 */
